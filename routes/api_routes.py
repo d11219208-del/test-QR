@@ -1,11 +1,45 @@
 from flask import Blueprint, jsonify, request
 from database import get_db_connection
 from datetime import datetime
+import json  # 💡 引入 json 模組來解析餐點欄位
 
 api_bp = Blueprint('api', __name__)
 
+def parse_items_to_chinese_only(items_raw_data):
+    """
+    💡 後端核心過濾器：將包含多國語言的 JSON 字串，直接在後端淨化為純中文文字
+    """
+    if not items_raw_data:
+        return "無餐點資料"
+    
+    try:
+        # 如果資料庫撈出來的是字串，先轉成 Python 列表；如果是 dict/list 則直接用
+        items_list = json.loads(items_raw_data) if isinstance(items_raw_data, str) else items_raw_data
+        
+        result_lines = []
+        for index, item in enumerate(items_list):
+            name_zh = item.get("name_zh", "未知商品")
+            qty = item.get("qty", 1)
+            
+            # 組裝品名與數量： "1. 👍豬血湯 x 1"
+            item_line = f"{index + 1}. {name_zh} x {qty}"
+            
+            # 處理客製化中文選項
+            options_zh = item.get("options_zh", [])
+            if options_zh and len(options_zh) > 0:
+                options_str = ", ".join(options_zh)
+                item_line += f" ({options_str})"
+                
+            result_lines.append(item_line)
+            
+        return "\n".join(result_lines) # 用換行符號連接每道菜
+    except Exception as e:
+        # 防呆：如果萬一解析失敗，返回原始資料
+        return str(items_raw_data)
+
+
 # ==========================================
-# 1. 獲取所有「待處理 (Pending)」的訂單 (維持原樣)
+# 1. 獲取所有「待處理 (Pending)」的訂單
 # ==========================================
 @api_bp.route('/orders/pending', methods=['GET'])
 def get_pending_orders():
@@ -27,7 +61,7 @@ def get_pending_orders():
             orders.append({
                 "id": row[0],
                 "table_number": row[1],
-                "items": row[2],
+                "items": parse_items_to_chinese_only(row[2]), # ⭕ 在這裡直接過濾成純中文文字！
                 "total_price": row[3],
                 "status": row[4],
                 "created_at": row[5].strftime('%Y-%m-%d %H:%M:%S') if row[5] else None,
@@ -42,10 +76,8 @@ def get_pending_orders():
 
 
 # ==========================================
-# 2. 變更訂單狀態 (支援：Processing / Cancelled 等)
+# 2. 變更訂單狀態
 # ==========================================
-# 💡 註：這個不用動！因為我們原本就設計接收 data.get('status')。
-# 當 Android 傳 {"status": "Processing"} 就是接單；傳 {"status": "Cancelled"} 就是拒絕！
 @api_bp.route('/orders/<int:order_id>/status', methods=['PUT'])
 def update_order_status(order_id):
     data = request.get_json()
@@ -70,13 +102,12 @@ def update_order_status(order_id):
 
 
 # ==========================================
-# ✨ 新增 3. 區間營業報告 (ReportActivity 呼叫)
+# 3. 區間營業報告
 # ==========================================
-# 讓 Android 傳入 start_date 與 end_date，計算該區間「已完成(Completed)」的總營業額與訂單數
 @api_bp.route('/reports/revenue', methods=['GET'])
 def get_revenue_report():
-    start_date = request.args.get('start_date') # 格式: YYYY-MM-DD
-    end_date = request.args.get('end_date')     # 格式: YYYY-MM-DD
+    start_date = request.args.get('start_date')
+    end_date = request.args.get('end_date')
     
     if not start_date or not end_date:
         return jsonify({"success": False, "message": "請提供 start_date 與 end_date"}), 400
@@ -86,17 +117,13 @@ def get_revenue_report():
     try:
         conn = get_db_connection()
         cur = conn.cursor()
-        
-        # 💡 計算總營業額與總單數 (排除已取消或Pending的訂單)
         cur.execute("""
             SELECT COALESCE(SUM(total_price), 0), COUNT(id) 
             FROM orders 
             WHERE status = 'Completed' 
               AND created_at >= %s AND created_at <= %s
         """, (f"{start_date} 00:00:00", f"{end_date} 23:59:59"))
-        
         row = cur.fetchone()
-        
         return jsonify({
             "success": True, 
             "data": {
@@ -112,11 +139,8 @@ def get_revenue_report():
 
 
 # ==========================================
-# ✨ 新增 4. 銷售排行 (RankingActivity 呼叫)
+# 4. 銷售排行
 # ==========================================
-# 註：這裡假設你的 items 欄位在規模大時會拆獨立的 order_items 關聯表。
-# 目前若先以文字存 items，為了方便你展示排行，後端可以撈出這段時間內所有訂單的 items 交給前端，或做簡單加總。
-# 這裡先提供一個撈取指定時間內所有熱銷餐點資料的基礎 API。
 @api_bp.route('/reports/ranking', methods=['GET'])
 def get_sales_ranking():
     conn = None
@@ -124,14 +148,15 @@ def get_sales_ranking():
     try:
         conn = get_db_connection()
         cur = conn.cursor()
-        # 撈取最近一個月已完成的訂單明細，用來給前端統計排行
         cur.execute("""
             SELECT items FROM orders 
             WHERE status = 'Completed' 
             ORDER BY created_at DESC LIMIT 50
         """)
         rows = cur.fetchall()
-        items_list = [row[0] for row in rows]
+        
+        # 這裡同樣可以將排行需要的資料做中文化處理，或者直接回傳純文字
+        items_list = [parse_items_to_chinese_only(row[0]) for row in rows]
         
         return jsonify({"success": True, "data": items_list}), 200
     except Exception as e:
@@ -142,9 +167,8 @@ def get_sales_ranking():
 
 
 # ==========================================
-# ✨ 新增 5. 歷史訂單查詢 (HistoryActivity 呼叫)
+# 5. 歷史訂單查詢
 # ==========================================
-# 撈取所有非 Pending 的歷史紀錄 (Processing, Completed, Cancelled)
 @api_bp.route('/orders/history', methods=['GET'])
 def get_order_history():
     conn = None
@@ -166,7 +190,7 @@ def get_order_history():
             orders.append({
                 "id": row[0],
                 "table_number": row[1],
-                "items": row[2],
+                "items": parse_items_to_chinese_only(row[2]), # ⭕ 歷史紀錄也一併在後端轉成乾淨的純中文！
                 "total_price": row[3],
                 "status": row[4],
                 "created_at": row[5].strftime('%Y-%m-%d %H:%M:%S') if row[5] else None,
