@@ -1,257 +1,174 @@
 from flask import Blueprint, jsonify, request
-from database import get_db_connection
-from datetime import datetime
+from datetime import timedelta
+import json
 import re
-import json  # 引入 json 模組來解析餐點欄位
-import sys   # 用於直接印出錯誤到終端機
+import traceback
+# 💡 請根據你的專案結構，確保引入了正確的資料庫與時間函式
+from utils.db import get_db_connection  
+from utils.time_utils import get_tw_time_range  
 
 api_bp = Blueprint('api', __name__)
 
-def _extract_chinese_from_list(items_list):
-    """
-    💡 核心輔助函式：從解析成功的 JSON 物件/列表中，精準抽取出中文名稱與選項
-    """
-    # 如果最外層是 dict（Object），試著找出裡面的陣列
-    if isinstance(items_list, dict):
-        if "items" in items_list: 
-            items_list = items_list["items"]
-        elif "data" in items_list: 
-            items_list = items_list["data"]
-        else: 
-            items_list = [items_list]
-        
-    if not isinstance(items_list, list):
-        return str(items_list)
-        
-    result_lines = []
-    for index, item in enumerate(items_list):
-        # 優先抓取中文品名 (name_zh)
-        name_zh = item.get("name_zh", "")
-        if not name_zh:
-            name_zh = item.get("name", "未知商品")
-            
-        qty = item.get("qty", 1)
-        item_line = f"{index + 1}. {name_zh} x {qty}"
-        
-        # 抓取客製化中文選項 (options_zh)
-        options_zh = item.get("options_zh", [])
-        if options_zh and isinstance(options_zh, list) and len(options_zh) > 0:
-            item_line += f" ({', '.join(options_zh)})"
-            
-        result_lines.append(item_line)
-    
-    final_output = "\n".join(result_lines)
-    print(f"[Debug] JSON 中文提取成功，最終輸出:\n{final_output}", file=sys.stderr)
-    return final_output
-
-
+# ─── 🛡️ 核心輔助工具：智慧留底與純文字過濾器 ───
 def parse_items_to_chinese_only(items_raw_data):
     """
-    💡 核心過濾器：將包含多國語言的 JSON 字串或已被污染的外文字串，淨化為純中文文字
+    當 content_json 無法解析時的第二道防線：過濾純外文字串
     """
-    print(f"=== [Debug] 收到 items 資料 ===", file=sys.stderr)
-    print(f"原始型態: {type(items_raw_data)}", file=sys.stderr)
-    print(f"原始內容: {repr(items_raw_data)}", file=sys.stderr)
+    try:
+        if not items_raw_data or str(items_raw_data).strip() == "":
+            return "無餐點資料"
 
-    if not items_raw_data:
-        return "無餐點資料"
-    
-    # 如果資料庫撈出來本身就是 list 或 dict 類型的物件，直接處理
-    if isinstance(items_raw_data, (list, dict)):
-        print(f"[Debug] 資料本身就是 Python 物件，直接進入解析", file=sys.stderr)
-        return _extract_chinese_from_list(items_raw_data)
+        raw_str = str(items_raw_data).strip()
+        backup_text = raw_str.replace(" + ", "\n").replace("+", "\n").strip()
 
-    # 強制轉為字串並去除前後空白
-    cleaned_str = str(items_raw_data).strip()
-    
-    # ─── 【第一道防線】精準 JSON 解析 ───
-    if cleaned_str.startswith('[') or cleaned_str.startswith('{'):
-        try:
-            items_list = json.loads(cleaned_str)
-            print(f"[Debug] json.loads 解析成功！", file=sys.stderr)
-            return _extract_chinese_from_list(items_list)
-        except Exception as e:
-            print(f"[Debug] json.loads 失敗，錯誤原因: {str(e)}", file=sys.stderr)
-            pass
+        # 1. 嘗試解開可能存在的雙重 JSON 字串
+        parsed_data = None
+        if raw_str.startswith('[') or raw_str.startswith('{'):
+            try:
+                parsed_data = json.loads(raw_str)
+                if isinstance(parsed_data, str) and (parsed_data.startswith('[') or parsed_data.startswith('{')):
+                    parsed_data = json.loads(parsed_data)
+            except Exception:
+                pass
 
-    # ─── 【第二道防線】非 JSON 的純外文字串強力濾鏡 ───
-    print(f"[Debug] 判定非標準 JSON，進入文字過濾防線", file=sys.stderr)
-    text = cleaned_str
-    
-    # 移除英日韓文
-    text = re.sub(r'[\u3040-\u309F\u30A0-\u30FF]', '', text)
-    text = re.sub(r'[\uAC00-\uD7A3\u1100-\u11FF]', '', text)
-    text = re.sub(r'(?<!\d)[a-zA-Z](?!\d)', '', text)
-    
-    # 整理符號
-    text = text.replace("()", "").replace("(,)", "")
-    text = re.sub(r',\s*,', ',', text)
-    text = re.sub(r'\+\s*\+', '+', text)
-    text = re.sub(r'\s+', ' ', text)
-    text = text.replace(" + ", "\n").replace("+", "\n")
-    
-    print(f"[Debug] 文字過濾完成，輸出結果: {text}", file=sys.stderr)
-    return text.strip()
+        if isinstance(parsed_data, dict):
+            parsed_data = parsed_data.get("items", parsed_data.get("data", [parsed_data]))
+
+        if isinstance(parsed_data, list):
+            result_lines = []
+            for index, item in enumerate(parsed_data):
+                if isinstance(item, dict):
+                    name_zh = item.get("name_zh") or item.get("name") or "未知商品"
+                    qty = item.get("qty", 1)
+                    line = f"{index + 1}. {name_zh} x {qty}"
+                    opts = item.get("options_zh", [])
+                    if opts and isinstance(opts, list):
+                        line += f" ({', '.join(str(o) for o in opts)})"
+                    result_lines.append(line)
+                else:
+                    result_lines.append(f"- {str(item)}")
+            if result_lines:
+                return "\n".join(result_lines)
+
+        # 2. 進行純文字正則過濾
+        text = raw_str
+        text = re.sub(r'[\u3040-\u309F\u30A0-\u30FF]', '', text)  # 拔除日文假名
+        text = re.sub(r'[\uAC00-\uD7A3\u1100-\u11FF]', '', text)  # 拔除韓文
+        text = re.sub(r'(?<!\d)[a-zA-Z](?!\d)', '', text)        # 拔除獨立英文
+        
+        text = text.replace("()", "").replace("(,)", "")
+        text = re.sub(r',\s*,', ',', text)
+        text = re.sub(r'\+\s*\+', '+', text)
+        text = text.replace(" + ", "\n").replace("+", "\n").strip()
+        
+        # 3. 檢查過濾後是否只剩下空白或符號（代表是純外文單，如純韓文）
+        remaining_content = re.sub(r'[\s\d(),+xX👍✨\n\-]', '', text)
+        if len(remaining_content.strip()) == 0:
+            return backup_text  # 觸發智慧留底，回傳原外文
+            
+        return text
+
+    except Exception as e:
+        return f"[過濾錯誤] {str(e)}"
 
 
-# ==========================================
-# 1. 獲取所有「待處理 (Pending)」的訂單
-# ==========================================
+# ─── 📱 Android App 專用：獲取待處理訂單 API ───
 @api_bp.route('/orders/pending', methods=['GET'])
 def get_pending_orders():
-    conn = None
-    cur = None
     try:
+        # 1. 取得台灣時間的今日起訖時間 (轉換為 UTC 時間以便與資料庫比對)
+        utc_start, utc_end = get_tw_time_range()
+
+        # 2. 建立資料庫連線
         conn = get_db_connection()
         cur = conn.cursor()
-        cur.execute("""
-            SELECT id, table_number, items, total_price, status, created_at, order_type 
-            FROM orders 
-            WHERE status = 'Pending'
-            ORDER BY created_at ASC
-        """)
-        rows = cur.fetchall()
         
-        orders = []
-        for row in rows:
-            orders.append({
-                "id": row[0],
-                "table_number": row[1],
-                "items": parse_items_to_chinese_only(row[2]),
-                "total_price": row[3],
-                "status": row[4],
-                "created_at": row[5].strftime('%Y-%m-%d %H:%M:%S') if row[5] else None,
-                "order_type": row[6]
+        # 3. 主要 SQL 查詢：同步 kitchen_routes.py 的 15 個欄位與排序邏輯
+        query = """
+            SELECT id, table_number, items, total_price, status, created_at, lang, daily_seq, content_json,
+                   customer_name, customer_phone, customer_address, scheduled_for, delivery_fee, order_type
+            FROM orders 
+            WHERE created_at >= %s AND created_at <= %s AND status = 'Pending'
+            ORDER BY daily_seq ASC
+        """
+        try:
+            cur.execute(query, (utc_start, utc_end))
+        except Exception as e:
+            # 🔄 降級方案 (Fallback)：若資料庫缺 order_type 欄位，自動補上 'unknown' 防止崩潰
+            conn.rollback()
+            print(f"SQL Fallback triggered (api_pending_orders): {e}")
+            query_fallback = """
+                SELECT id, table_number, items, total_price, status, created_at, lang, daily_seq, content_json,
+                       customer_name, customer_phone, customer_address, scheduled_for, delivery_fee, 'unknown'
+                FROM orders 
+                WHERE created_at >= %s AND created_at <= %s AND status = 'Pending'
+                ORDER BY daily_seq ASC
+            """
+            cur.execute(query_fallback, (utc_start, utc_end))
+
+        orders = cur.fetchall()
+        conn.close()
+
+        # 4. 逐筆打包為 Android 專用 JSON 格式
+        api_data_list = []
+        for o in orders:
+            # 完整解包 15 個變數，確保結構與 kitchen 一致
+            oid, table, raw_items, total, status, created, order_lang, seq_num, c_json, \
+            c_name, c_phone, c_addr, c_schedule, c_fee, c_type = o
+
+            # 🕒 時間對齊：與 kitchen 一樣，將資料庫 UTC 轉回台灣時間字串
+            tw_time = created + timedelta(hours=8)
+            tw_time_str = tw_time.strftime('%Y-%m-%d %H:%M:%S')
+
+            # 🥢 商品明細核心解析 (優先使用結構完整的 content_json)
+            items_final_text = ""
+            try:
+                if isinstance(c_json, str):
+                    cart = json.loads(c_json)
+                elif isinstance(c_json, (list, dict)):
+                    cart = c_json if isinstance(c_json, list) else [c_json]
+                else:
+                    cart = []
+
+                if cart:
+                    lines = []
+                    for index, item in enumerate(cart):
+                        name = item.get('name_zh', item.get('name', '商品'))  # 優先抓中文名
+                        qty = item.get('qty', 1)
+                        options = item.get('options_zh', item.get('options', []))
+                        
+                        line = f"{index + 1}. {name} x {qty}"
+                        if options and isinstance(options, list):
+                            line += f" ({', '.join(options)})"
+                        lines.append(line)
+                    items_final_text = "\n".join(lines)
+            except Exception:
+                items_final_text = ""
+
+            # 🛡️ 備用防線：如果 content_json 解析出來是空的，就啟用智慧純文字過濾器
+            if not items_final_text.strip():
+                items_final_text = parse_items_to_chinese_only(raw_items)
+
+            # 🍱 封裝成 Android 端需要的 Model 格式 (對應你的 Order.java)
+            api_data_list.append({
+                "id": oid,
+                "table_number": str(table).strip() if table else "外帶",
+                "items": items_final_text,  # 🌟 完美的純文字排版，絕不為空
+                "total_price": int(total or 0),
+                "status": status,
+                "created_at": tw_time_str,
+                "order_type": str(c_type).lower() if c_type else 'dine_in'
             })
-        return jsonify({"success": True, "data": orders}), 200
-    except Exception as e:
-        return jsonify({"success": False, "message": str(e)}), 500
-    finally:
-        if cur: cur.close()
-        if conn: conn.close()
 
-
-# ==========================================
-# 2. 變更訂單狀態
-# ==========================================
-@api_bp.route('/orders/<int:order_id>/status', methods=['PUT'])
-def update_order_status(order_id):
-    data = request.get_json()
-    new_status = data.get('status') 
-    
-    if not new_status:
-        return jsonify({"success": False, "message": "缺少 status 欄位"}), 400
-        
-    conn = None
-    cur = None
-    try:
-        conn = get_db_connection()
-        cur = conn.cursor()
-        cur.execute("UPDATE orders SET status = %s WHERE id = %s", (new_status, order_id))
-        conn.commit()
-        return jsonify({"success": True, "message": f"訂單 {order_id} 狀態已更新為 {new_status}"}), 200
-    except Exception as e:
-        return jsonify({"success": False, "message": str(e)}), 500
-    finally:
-        if cur: cur.close()
-        if conn: conn.close()
-
-
-# ==========================================
-# 3. 區間營業報告
-# ==========================================
-@api_bp.route('/reports/revenue', methods=['GET'])
-def get_revenue_report():
-    start_date = request.args.get('start_date')
-    end_date = request.args.get('end_date')
-    
-    if not start_date or not end_date:
-        return jsonify({"success": False, "message": "請提供 start_date 與 end_date"}), 400
-        
-    conn = None
-    cur = None
-    try:
-        conn = get_db_connection()
-        cur = conn.cursor()
-        cur.execute("""
-            SELECT COALESCE(SUM(total_price), 0), COUNT(id) 
-            FROM orders 
-            WHERE status = 'Completed' 
-              AND created_at >= %s AND created_at <= %s
-        """, (f"{start_date} 00:00:00", f"{end_date} 23:59:59"))
-        row = cur.fetchone()
         return jsonify({
-            "success": True, 
-            "data": {
-                "total_revenue": row[0],
-                "order_count": row[1]
-            }
-        }), 200
+            "success": True,
+            "data": api_data_list
+        })
+
     except Exception as e:
-        return jsonify({"success": False, "message": str(e)}), 500
-    finally:
-        if cur: cur.close()
-        if conn: conn.close()
-
-
-# ==========================================
-# 4. 銷售排行
-# ==========================================
-@api_bp.route('/reports/ranking', methods=['GET'])
-def get_sales_ranking():
-    conn = None
-    cur = None
-    try:
-        conn = get_db_connection()
-        cur = conn.cursor()
-        cur.execute("""
-            SELECT items FROM orders 
-            WHERE status = 'Completed' 
-            ORDER BY created_at DESC LIMIT 50
-        """)
-        rows = cur.fetchall()
-        items_list = [parse_items_to_chinese_only(row[0]) for row in rows]
-        return jsonify({"success": True, "data": items_list}), 200
-    except Exception as e:
-        return jsonify({"success": False, "message": str(e)}), 500
-    finally:
-        if cur: cur.close()
-        if conn: conn.close()
-
-
-# ==========================================
-# 5. 歷史訂單查詢
-# ==========================================
-@api_bp.route('/orders/history', methods=['GET'])
-def get_order_history():
-    conn = None
-    cur = None
-    try:
-        conn = get_db_connection()
-        cur = conn.cursor()
-        cur.execute("""
-            SELECT id, table_number, items, total_price, status, created_at, order_type 
-            FROM orders 
-            WHERE status != 'Pending'
-            ORDER BY created_at DESC 
-            LIMIT 100
-        """)
-        rows = cur.fetchall()
-        
-        orders = []
-        for row in rows:
-            orders.append({
-                "id": row[0],
-                "table_number": row[1],
-                "items": parse_items_to_chinese_only(row[2]),
-                "total_price": row[3],
-                "status": row[4],
-                "created_at": row[5].strftime('%Y-%m-%d %H:%M:%S') if row[5] else None,
-                "order_type": row[6]
-            })
-        return jsonify({"success": True, "data": orders}), 200
-    except Exception as e:
-        return jsonify({"success": False, "message": str(e)}), 500
-    finally:
-        if cur: cur.close()
-        if conn: conn.close()
+        traceback.print_exc()
+        return jsonify({
+            "success": False,
+            "error": str(e),
+            "data": []
+        }), 500
