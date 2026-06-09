@@ -8,8 +8,11 @@ from routes import menu_bp, kitchen_bp, admin_bp, delivery_bp
 # --- 新增引用：引用剛剛建立的 try_routes (資料庫檢視功能) ---
 from routes.try_routes import try_bp 
 
-# 💡 修改引入：把我們剛剛在 utils.py 寫好的 inject_user_info 一起引進來
+# 修改引入：把我們剛剛在 utils.py 寫好的 inject_user_info 一起引進來
 from utils import start_background_tasks, inject_user_info
+
+from routes.api_routes import api_bp
+
 
 def create_app():
     app = Flask(__name__)
@@ -42,10 +45,13 @@ def create_app():
     app.register_blueprint(try_bp, url_prefix='/try')
 
     # ==========================================
-    # 💡 新增註冊：上下文處理器 (Context Processor)
+    # 新增註冊：上下文處理器 (Context Processor)
     # 這樣一來，所有的 HTML 網頁就都能直接讀取到 current_username 和 logout_url 了！
     # ==========================================
     app.context_processor(inject_user_info)
+
+    # 註冊 API 藍圖，並指定所有路徑開頭都是 /api
+    app.register_blueprint(api_bp, url_prefix='/api')
 
     # 3. 啟動背景任務 (排程發信、防休眠 Ping)
     start_background_tasks(app)
