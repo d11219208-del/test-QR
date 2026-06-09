@@ -3,9 +3,6 @@ from datetime import timedelta
 import json
 import re
 import traceback
-# 💡 請根據你的專案結構，確保引入了正確的資料庫與時間函式
-from utils.db import get_db_connection  
-from utils.time_utils import get_tw_time_range  
 
 api_bp = Blueprint('api', __name__)
 
