@@ -8,54 +8,77 @@ api_bp = Blueprint('api', __name__)
 
 def parse_items_to_chinese_only(items_raw_data):
     """
-    💡 終極後端淨化器：不管是 JSON 還是已經變成外文的純文字，
-    一律強制抽離英、日、韓文，只留下中文、數字、數量和常用符號。
+    安全版後端淨化器：
+    1. 優先精準解析 JSON，完整保留中文品名與客製化選項。
+    2. 只有在確定不是 JSON 時，才針對外文字串進行過濾，絕不誤殺正常訂單。
     """
     if not items_raw_data:
         return "無餐點資料"
     
-    # --- 第一道防線：如果原本是標準 JSON，就走精準中文提取 ---
-    try:
-        items_list = json.loads(items_raw_data) if isinstance(items_raw_data, str) else items_raw_data
-        if isinstance(items_list, list):
-            result_lines = []
-            for index, item in enumerate(items_list):
-                name_zh = item.get("name_zh", "未知商品")
-                qty = item.get("qty", 1)
-                item_line = f"{index + 1}. {name_zh} x {qty}"
-                
-                options_zh = item.get("options_zh", [])
-                if options_zh and len(options_zh) > 0:
-                    item_line += f" ({', '.join(options_zh)})"
-                result_lines.append(item_line)
-            return "\n".join(result_lines)
-    except Exception:
-        # 如果不是標準 JSON，代表是像你提供的那種已經變成外文純文字的字串，直接往下走第二道防線
-        pass
-
-    # --- 第二道防線：強力正則濾鏡（專治已經被轉成外文的純文字） ---
-    text = str(items_raw_data)
+    # 強制轉為字串型態以便檢查開頭
+    cleaned_str = str(items_raw_data).strip()
     
-    # 1. 抹除日文字元 (平假名、片假名)
+    # ─── 【第一道防線】精準 JSON 解析（不誤殺中文的關鍵） ───
+    # 判斷是否為 JSON 陣列 [ ... ] 或物件 { ... }
+    if cleaned_str.startswith('[') or cleaned_str.startswith('{'):
+        try:
+            # 解析成 Python 字典或列表
+            items_list = json.loads(cleaned_str)
+            
+            # 如果最外層是字典（Object），試著找出裡面的陣列
+            if isinstance(items_list, dict):
+                if "items" in items_list:
+                    items_list = items_list["items"]
+                elif "data" in items_list:
+                    items_list = items_list["data"]
+                else:
+                    items_list = [items_list] # 強制轉成單個元素的 list
+            
+            if isinstance(items_list, list):
+                result_lines = []
+                for index, item in enumerate(items_list):
+                    # 抓取中文品名
+                    name_zh = item.get("name_zh", "")
+                    if not name_zh:
+                        name_zh = item.get("name", "未知商品")
+                        
+                    qty = item.get("qty", 1)
+                    item_line = f"{index + 1}. {name_zh} x {qty}"
+                    
+                    # 抓取客製化中文選項
+                    options_zh = item.get("options_zh", [])
+                    if options_zh and len(options_zh) > 0:
+                        item_line += f" ({', '.join(options_zh)})"
+                        
+                    result_lines.append(item_line)
+                
+                # 順利解析成功，直接返回組裝好的純中文列表，直接結束函數！
+                return "\n".join(result_lines)
+                
+        except Exception as e:
+            # 如果開頭像 JSON 但解析失敗，才往下走到文字過濾
+            pass
+
+    # ─── 【第二道防線】非 JSON 的純外文字串強力濾鏡 ───
+    text = cleaned_str
+    
+    # 1. 移除日文字元 (平假名、片假名)
     text = re.sub(r'[\u3040-\u309F\u30A0-\u30FF]', '', text)
-    # 2. 抹除韓文字元
+    # 2. 移除韓文字元
     text = re.sub(r'[\uAC00-\uD7A3\u1100-\u11FF]', '', text)
-    # 3. 抹除英文字母 (保留用於數量的 'x' 或是 'X'，但前後通常帶數字)
-    # 這裡我們精準一點：只刪除沒有和數字連在一起的純英文字母
+    # 3. 移除獨立的英文字母（保留如 x4, x1 這種緊跟數字的數量標記）
     text = re.sub(r'(?<!\d)[a-zA-Z](?!\d)', '', text)
     
-    # --- 整理因刪除文字而產生的雜亂符號 ---
-    text = text.replace("()", "")            # 移除空的括號
-    text = text.replace("(,)", "")
-    text = re.sub(r',\s*,', ',', text)       # 把重複的逗號變成單個
-    text = re.sub(r'\+\s*\+', '+', text)     # 把重複的加號變成單個
-    text = re.sub(r'\s+', ' ', text)         # 多個空格變單個空格
+    # 整理刪除外文後遺留的空括號與雜亂符號
+    text = text.replace("()", "").replace("(,)", "")
+    text = re.sub(r',\s*,', ',', text)
+    text = re.sub(r'\+\s*\+', '+', text)
+    text = re.sub(r'\s+', ' ', text)
     
-    # 為了讓廚房好看，我們把多道菜之間的 " + " 變成「換行」，看起來就像列表！
+    # 將多道菜之間的加號換成換行，方便手機排版
     text = text.replace(" + ", "\n").replace("+", "\n")
     
     return text.strip()
-
 
 # ==========================================
 # 1. 獲取所有「待處理 (Pending)」的訂單
