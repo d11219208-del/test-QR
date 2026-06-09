@@ -1,41 +1,60 @@
 from flask import Blueprint, jsonify, request
 from database import get_db_connection
 from datetime import datetime
+import re
 import json  # 💡 引入 json 模組來解析餐點欄位
 
 api_bp = Blueprint('api', __name__)
 
 def parse_items_to_chinese_only(items_raw_data):
     """
-    💡 後端核心過濾器：將包含多國語言的 JSON 字串，直接在後端淨化為純中文文字
+    💡 終極後端淨化器：不管是 JSON 還是已經變成外文的純文字，
+    一律強制抽離英、日、韓文，只留下中文、數字、數量和常用符號。
     """
     if not items_raw_data:
         return "無餐點資料"
     
+    # --- 第一道防線：如果原本是標準 JSON，就走精準中文提取 ---
     try:
-        # 如果資料庫撈出來的是字串，先轉成 Python 列表；如果是 dict/list 則直接用
         items_list = json.loads(items_raw_data) if isinstance(items_raw_data, str) else items_raw_data
-        
-        result_lines = []
-        for index, item in enumerate(items_list):
-            name_zh = item.get("name_zh", "未知商品")
-            qty = item.get("qty", 1)
-            
-            # 組裝品名與數量： "1. 👍豬血湯 x 1"
-            item_line = f"{index + 1}. {name_zh} x {qty}"
-            
-            # 處理客製化中文選項
-            options_zh = item.get("options_zh", [])
-            if options_zh and len(options_zh) > 0:
-                options_str = ", ".join(options_zh)
-                item_line += f" ({options_str})"
+        if isinstance(items_list, list):
+            result_lines = []
+            for index, item in enumerate(items_list):
+                name_zh = item.get("name_zh", "未知商品")
+                qty = item.get("qty", 1)
+                item_line = f"{index + 1}. {name_zh} x {qty}"
                 
-            result_lines.append(item_line)
-            
-        return "\n".join(result_lines) # 用換行符號連接每道菜
-    except Exception as e:
-        # 防呆：如果萬一解析失敗，返回原始資料
-        return str(items_raw_data)
+                options_zh = item.get("options_zh", [])
+                if options_zh and len(options_zh) > 0:
+                    item_line += f" ({', '.join(options_zh)})"
+                result_lines.append(item_line)
+            return "\n".join(result_lines)
+    except Exception:
+        # 如果不是標準 JSON，代表是像你提供的那種已經變成外文純文字的字串，直接往下走第二道防線
+        pass
+
+    # --- 第二道防線：強力正則濾鏡（專治已經被轉成外文的純文字） ---
+    text = str(items_raw_data)
+    
+    # 1. 抹除日文字元 (平假名、片假名)
+    text = re.sub(r'[\u3040-\u309F\u30A0-\u30FF]', '', text)
+    # 2. 抹除韓文字元
+    text = re.sub(r'[\uAC00-\uD7A3\u1100-\u11FF]', '', text)
+    # 3. 抹除英文字母 (保留用於數量的 'x' 或是 'X'，但前後通常帶數字)
+    # 這裡我們精準一點：只刪除沒有和數字連在一起的純英文字母
+    text = re.sub(r'(?<!\d)[a-zA-Z](?!\d)', '', text)
+    
+    # --- 整理因刪除文字而產生的雜亂符號 ---
+    text = text.replace("()", "")            # 移除空的括號
+    text = text.replace("(,)", "")
+    text = re.sub(r',\s*,', ',', text)       # 把重複的逗號變成單個
+    text = re.sub(r'\+\s*\+', '+', text)     # 把重複的加號變成單個
+    text = re.sub(r'\s+', ' ', text)         # 多個空格變單個空格
+    
+    # 為了讓廚房好看，我們把多道菜之間的 " + " 變成「換行」，看起來就像列表！
+    text = text.replace(" + ", "\n").replace("+", "\n")
+    
+    return text.strip()
 
 
 # ==========================================
