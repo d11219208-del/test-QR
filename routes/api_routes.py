@@ -2,83 +2,97 @@ from flask import Blueprint, jsonify, request
 from database import get_db_connection
 from datetime import datetime
 import re
-import json  # 💡 引入 json 模組來解析餐點欄位
+import json  # 引入 json 模組來解析餐點欄位
+import sys   # 用於直接印出錯誤到終端機
 
 api_bp = Blueprint('api', __name__)
 
+def _extract_chinese_from_list(items_list):
+    """
+    💡 核心輔助函式：從解析成功的 JSON 物件/列表中，精準抽取出中文名稱與選項
+    """
+    # 如果最外層是 dict（Object），試著找出裡面的陣列
+    if isinstance(items_list, dict):
+        if "items" in items_list: 
+            items_list = items_list["items"]
+        elif "data" in items_list: 
+            items_list = items_list["data"]
+        else: 
+            items_list = [items_list]
+        
+    if not isinstance(items_list, list):
+        return str(items_list)
+        
+    result_lines = []
+    for index, item in enumerate(items_list):
+        # 優先抓取中文品名 (name_zh)
+        name_zh = item.get("name_zh", "")
+        if not name_zh:
+            name_zh = item.get("name", "未知商品")
+            
+        qty = item.get("qty", 1)
+        item_line = f"{index + 1}. {name_zh} x {qty}"
+        
+        # 抓取客製化中文選項 (options_zh)
+        options_zh = item.get("options_zh", [])
+        if options_zh and isinstance(options_zh, list) and len(options_zh) > 0:
+            item_line += f" ({', '.join(options_zh)})"
+            
+        result_lines.append(item_line)
+    
+    final_output = "\n".join(result_lines)
+    print(f"[Debug] JSON 中文提取成功，最終輸出:\n{final_output}", file=sys.stderr)
+    return final_output
+
+
 def parse_items_to_chinese_only(items_raw_data):
     """
-    安全版後端淨化器：
-    1. 優先精準解析 JSON，完整保留中文品名與客製化選項。
-    2. 只有在確定不是 JSON 時，才針對外文字串進行過濾，絕不誤殺正常訂單。
+    💡 核心過濾器：將包含多國語言的 JSON 字串或已被污染的外文字串，淨化為純中文文字
     """
+    print(f"=== [Debug] 收到 items 資料 ===", file=sys.stderr)
+    print(f"原始型態: {type(items_raw_data)}", file=sys.stderr)
+    print(f"原始內容: {repr(items_raw_data)}", file=sys.stderr)
+
     if not items_raw_data:
         return "無餐點資料"
     
-    # 強制轉為字串型態以便檢查開頭
+    # 如果資料庫撈出來本身就是 list 或 dict 類型的物件，直接處理
+    if isinstance(items_raw_data, (list, dict)):
+        print(f"[Debug] 資料本身就是 Python 物件，直接進入解析", file=sys.stderr)
+        return _extract_chinese_from_list(items_raw_data)
+
+    # 強制轉為字串並去除前後空白
     cleaned_str = str(items_raw_data).strip()
     
-    # ─── 【第一道防線】精準 JSON 解析（不誤殺中文的關鍵） ───
-    # 判斷是否為 JSON 陣列 [ ... ] 或物件 { ... }
+    # ─── 【第一道防線】精準 JSON 解析 ───
     if cleaned_str.startswith('[') or cleaned_str.startswith('{'):
         try:
-            # 解析成 Python 字典或列表
             items_list = json.loads(cleaned_str)
-            
-            # 如果最外層是字典（Object），試著找出裡面的陣列
-            if isinstance(items_list, dict):
-                if "items" in items_list:
-                    items_list = items_list["items"]
-                elif "data" in items_list:
-                    items_list = items_list["data"]
-                else:
-                    items_list = [items_list] # 強制轉成單個元素的 list
-            
-            if isinstance(items_list, list):
-                result_lines = []
-                for index, item in enumerate(items_list):
-                    # 抓取中文品名
-                    name_zh = item.get("name_zh", "")
-                    if not name_zh:
-                        name_zh = item.get("name", "未知商品")
-                        
-                    qty = item.get("qty", 1)
-                    item_line = f"{index + 1}. {name_zh} x {qty}"
-                    
-                    # 抓取客製化中文選項
-                    options_zh = item.get("options_zh", [])
-                    if options_zh and len(options_zh) > 0:
-                        item_line += f" ({', '.join(options_zh)})"
-                        
-                    result_lines.append(item_line)
-                
-                # 順利解析成功，直接返回組裝好的純中文列表，直接結束函數！
-                return "\n".join(result_lines)
-                
+            print(f"[Debug] json.loads 解析成功！", file=sys.stderr)
+            return _extract_chinese_from_list(items_list)
         except Exception as e:
-            # 如果開頭像 JSON 但解析失敗，才往下走到文字過濾
+            print(f"[Debug] json.loads 失敗，錯誤原因: {str(e)}", file=sys.stderr)
             pass
 
     # ─── 【第二道防線】非 JSON 的純外文字串強力濾鏡 ───
+    print(f"[Debug] 判定非標準 JSON，進入文字過濾防線", file=sys.stderr)
     text = cleaned_str
     
-    # 1. 移除日文字元 (平假名、片假名)
+    # 移除英日韓文
     text = re.sub(r'[\u3040-\u309F\u30A0-\u30FF]', '', text)
-    # 2. 移除韓文字元
     text = re.sub(r'[\uAC00-\uD7A3\u1100-\u11FF]', '', text)
-    # 3. 移除獨立的英文字母（保留如 x4, x1 這種緊跟數字的數量標記）
     text = re.sub(r'(?<!\d)[a-zA-Z](?!\d)', '', text)
     
-    # 整理刪除外文後遺留的空括號與雜亂符號
+    # 整理符號
     text = text.replace("()", "").replace("(,)", "")
     text = re.sub(r',\s*,', ',', text)
     text = re.sub(r'\+\s*\+', '+', text)
     text = re.sub(r'\s+', ' ', text)
-    
-    # 將多道菜之間的加號換成換行，方便手機排版
     text = text.replace(" + ", "\n").replace("+", "\n")
     
+    print(f"[Debug] 文字過濾完成，輸出結果: {text}", file=sys.stderr)
     return text.strip()
+
 
 # ==========================================
 # 1. 獲取所有「待處理 (Pending)」的訂單
@@ -103,7 +117,7 @@ def get_pending_orders():
             orders.append({
                 "id": row[0],
                 "table_number": row[1],
-                "items": parse_items_to_chinese_only(row[2]), # ⭕ 在這裡直接過濾成純中文文字！
+                "items": parse_items_to_chinese_only(row[2]),
                 "total_price": row[3],
                 "status": row[4],
                 "created_at": row[5].strftime('%Y-%m-%d %H:%M:%S') if row[5] else None,
@@ -196,10 +210,7 @@ def get_sales_ranking():
             ORDER BY created_at DESC LIMIT 50
         """)
         rows = cur.fetchall()
-        
-        # 這裡同樣可以將排行需要的資料做中文化處理，或者直接回傳純文字
         items_list = [parse_items_to_chinese_only(row[0]) for row in rows]
-        
         return jsonify({"success": True, "data": items_list}), 200
     except Exception as e:
         return jsonify({"success": False, "message": str(e)}), 500
@@ -232,7 +243,7 @@ def get_order_history():
             orders.append({
                 "id": row[0],
                 "table_number": row[1],
-                "items": parse_items_to_chinese_only(row[2]), # ⭕ 歷史紀錄也一併在後端轉成乾淨的純中文！
+                "items": parse_items_to_chinese_only(row[2]),
                 "total_price": row[3],
                 "status": row[4],
                 "created_at": row[5].strftime('%Y-%m-%d %H:%M:%S') if row[5] else None,
