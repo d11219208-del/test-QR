@@ -3,22 +3,30 @@ from datetime import datetime, timedelta
 import json
 import re
 import traceback
+# 💡 請確保從你的專案結構中正確匯入 get_db_connection
+# 假設 get_db_connection 在 database.py 中且在同級目錄：
+from database import get_db_connection 
 
 api_bp = Blueprint('api', __name__)
 
-# ─── 🛡️ 核心輔助工具：智慧留底與純文字過濾器 ───
+def get_tw_time_range():
+    """ 輔助函式：取得台灣時間今日的 UTC 起訖時間範圍 """
+    now_tw = datetime.utcnow() + timedelta(hours=8)
+    start_tw = now_tw.replace(hour=0, minute=0, second=0, microsecond=0)
+    end_tw = now_tw.replace(hour=23, minute=5, second=59, microsecond=999999)
+    # 轉回 UTC 給資料庫查詢
+    utc_start = start_tw - timedelta(hours=8)
+    utc_end = end_tw - timedelta(hours=8)
+    return utc_start, utc_end
+
 def parse_items_to_chinese_only(items_raw_data):
-    """
-    當 content_json 無法解析時的第二道防線：過濾純外文字串
-    """
+    """ 當 content_json 無法解析時的第二道防線：過濾純外文字串 """
     try:
         if not items_raw_data or str(items_raw_data).strip() == "":
             return "無餐點資料"
-
         raw_str = str(items_raw_data).strip()
         backup_text = raw_str.replace(" + ", "\n").replace("+", "\n").strip()
 
-        # 1. 嘗試解開可能存在的雙重 JSON 字串
         parsed_data = None
         if raw_str.startswith('[') or raw_str.startswith('{'):
             try:
@@ -47,40 +55,31 @@ def parse_items_to_chinese_only(items_raw_data):
             if result_lines:
                 return "\n".join(result_lines)
 
-        # 2. 進行純文字正則過濾
         text = raw_str
-        text = re.sub(r'[\u3040-\u309F\u30A0-\u30FF]', '', text)  # 拔除日文假名
+        text = re.sub(r'[\u3040-\u309F\u30A0-\u30FF]', '', text)  # 拔除日文
         text = re.sub(r'[\uAC00-\uD7A3\u1100-\u11FF]', '', text)  # 拔除韓文
         text = re.sub(r'(?<!\d)[a-zA-Z](?!\d)', '', text)        # 拔除獨立英文
-        
         text = text.replace("()", "").replace("(,)", "")
         text = re.sub(r',\s*,', ',', text)
         text = re.sub(r'\+\s*\+', '+', text)
         text = text.replace(" + ", "\n").replace("+", "\n").strip()
         
-        # 3. 檢查過濾後是否只剩下空白或符號（代表是純外文單，如純韓文）
         remaining_content = re.sub(r'[\s\d(),+xX👍✨\n\-]', '', text)
         if len(remaining_content.strip()) == 0:
-            return backup_text  # 觸發智慧留底，回傳原外文
+            return backup_text
             
         return text
-
     except Exception as e:
         return f"[過濾錯誤] {str(e)}"
 
-
-# ─── 📱 Android App 專用：獲取待處理訂單 API ───
+# ─── 📱 1. 獲取待處理訂單 API ───
 @api_bp.route('/orders/pending', methods=['GET'])
 def get_pending_orders():
     try:
-        # 1. 取得台灣時間的今日起訖時間 (轉換為 UTC 時間以便與資料庫比對)
         utc_start, utc_end = get_tw_time_range()
-
-        # 2. 建立資料庫連線
         conn = get_db_connection()
         cur = conn.cursor()
         
-        # 3. 主要 SQL 查詢：同步 kitchen_routes.py 的 15 個欄位與排序邏輯
         query = """
             SELECT id, table_number, items, total_price, status, created_at, lang, daily_seq, content_json,
                    customer_name, customer_phone, customer_address, scheduled_for, delivery_fee, order_type
@@ -91,9 +90,7 @@ def get_pending_orders():
         try:
             cur.execute(query, (utc_start, utc_end))
         except Exception as e:
-            # 🔄 降級方案 (Fallback)：若資料庫缺 order_type 欄位，自動補上 'unknown' 防止崩潰
             conn.rollback()
-            print(f"SQL Fallback triggered (api_pending_orders): {e}")
             query_fallback = """
                 SELECT id, table_number, items, total_price, status, created_at, lang, daily_seq, content_json,
                        customer_name, customer_phone, customer_address, scheduled_for, delivery_fee, 'unknown'
@@ -104,20 +101,17 @@ def get_pending_orders():
             cur.execute(query_fallback, (utc_start, utc_end))
 
         orders = cur.fetchall()
+        cur.close()
         conn.close()
 
-        # 4. 逐筆打包為 Android 專用 JSON 格式
         api_data_list = []
         for o in orders:
-            # 完整解包 15 個變數，確保結構與 kitchen 一致
             oid, table, raw_items, total, status, created, order_lang, seq_num, c_json, \
             c_name, c_phone, c_addr, c_schedule, c_fee, c_type = o
 
-            # 🕒 時間對齊：與 kitchen 一樣，將資料庫 UTC 轉回台灣時間字串
             tw_time = created + timedelta(hours=8)
             tw_time_str = tw_time.strftime('%Y-%m-%d %H:%M:%S')
 
-            # 🥢 商品明細核心解析 (優先使用結構完整的 content_json)
             items_final_text = ""
             try:
                 if isinstance(c_json, str):
@@ -130,7 +124,7 @@ def get_pending_orders():
                 if cart:
                     lines = []
                     for index, item in enumerate(cart):
-                        name = item.get('name_zh', item.get('name', '商品'))  # 優先抓中文名
+                        name = item.get('name_zh', item.get('name', '商品'))
                         qty = item.get('qty', 1)
                         options = item.get('options_zh', item.get('options', []))
                         
@@ -142,30 +136,50 @@ def get_pending_orders():
             except Exception:
                 items_final_text = ""
 
-            # 🛡️ 備用防線：如果 content_json 解析出來是空的，就啟用智慧純文字過濾器
             if not items_final_text.strip():
                 items_final_text = parse_items_to_chinese_only(raw_items)
 
-            # 🍱 封裝成 Android 端需要的 Model 格式 (對應你的 Order.java)
             api_data_list.append({
                 "id": oid,
                 "table_number": str(table).strip() if table else "外帶",
-                "items": items_final_text,  # 🌟 完美的純文字排版，絕不為空
+                "items": items_final_text,
                 "total_price": int(total or 0),
                 "status": status,
                 "created_at": tw_time_str,
                 "order_type": str(c_type).lower() if c_type else 'dine_in'
             })
 
-        return jsonify({
-            "success": True,
-            "data": api_data_list
-        })
-
+        return jsonify({"success": True, "data": api_data_list})
     except Exception as e:
         traceback.print_exc()
-        return jsonify({
-            "success": False,
-            "error": str(e),
-            "data": []
-        }), 500
+        return jsonify({"success": False, "error": str(e), "data": []}), 500
+
+# ─── 📱 2. 修改訂單狀態 (接單/拒單) API ───
+@api_bp.route('/orders/<int:order_id>/status', methods=['PUT'])
+def update_order_status(order_id):
+    try:
+        data = request.get_json() or {}
+        new_status = data.get('status') # 預期傳入 'Processing' (製作中) 或 'Cancelled'
+        
+        if not new_status:
+            return jsonify({"success": False, "error": "缺少 status 參數"}), 400
+
+        conn = get_db_connection()
+        cur = conn.cursor()
+        
+        cur.execute(
+            "UPDATE orders SET status = %s WHERE id = %s RETURNING id", 
+            (new_status, order_id)
+        )
+        updated_row = cur.fetchone()
+        conn.commit()
+        cur.close()
+        conn.close()
+
+        if updated_row:
+            return jsonify({"success": True, "message": f"訂單 {order_id} 狀態已更新為 {new_status}"})
+        else:
+            return jsonify({"success": False, "error": "找不到該訂單"}), 404
+    except Exception as e:
+        traceback.print_exc()
+        return jsonify({"success": False, "error": str(e)}), 500
